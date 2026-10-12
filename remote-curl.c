@@ -895,7 +895,7 @@ static int probe_rpc(struct rpc_state *rpc, struct slot_results *results)
 	curl_easy_setopt(slot->curl, CURLOPT_ENCODING, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, "0000");
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, 4L);
-	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, headers);
+	http_set_request_headers(slot, headers);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, fwrite_buffer);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEDATA, &buf);
 
@@ -1055,7 +1055,7 @@ retry:
 		}
 	}
 
-	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, headers);
+	http_set_request_headers(slot, headers);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, rpc_in);
 	rpc_in_data.rpc = rpc;
 	rpc_in_data.slot = slot;
