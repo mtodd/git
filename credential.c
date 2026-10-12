@@ -31,6 +31,10 @@ void credential_clear(struct credential *c)
 	free(c->username);
 	free(c->oauth_refresh_token);
 	free(c->authtype);
+	free(c->http_method);
+	free(c->http_url);
+	free(c->dpop_nonce);
+	free(c->dpop_helper);
 	string_list_clear(&c->helpers, 0);
 	strvec_clear(&c->wwwauth_headers);
 	strvec_clear(&c->state_headers);
@@ -49,6 +53,86 @@ void credential_clear_secrets(struct credential *c)
 {
 	FREE_AND_NULL(c->password);
 	FREE_AND_NULL(c->credential);
+	FREE_AND_NULL(c->dpop);
+}
+
+int credential_is_dpop(const struct credential *c)
+{
+	return credential_has_capability(&c->capa_dpop, CREDENTIAL_OP_RESPONSE) &&
+		(c->dpop || (c->authtype && !strcasecmp(c->authtype, "DPoP")));
+}
+
+void credential_set_http_request(struct credential *c, const char *method,
+				 const char *url)
+{
+	free(c->http_method);
+	free(c->http_url);
+	c->http_method = xstrdup(method);
+	c->http_url = xstrdup(url);
+	c->capa_authtype.request_initial = 1;
+	c->capa_state.request_initial = 1;
+	c->capa_dpop.request_initial = 1;
+}
+
+static int dpop_value_valid(const char *value, const char *extra)
+{
+	size_t len;
+
+	if (!value || !(len = strlen(value)) || len > CREDENTIAL_DPOP_MAX_VALUE)
+		return 0;
+	for (; *value; value++)
+		if (!isalnum((unsigned char)*value) && !strchr(extra, *value))
+			return 0;
+	return 1;
+}
+
+static int dpop_request_valid(const struct credential *c)
+{
+	const char *authority, *p;
+	size_t len;
+
+	if (!c->protocol || strcmp(c->protocol, "https") ||
+	    !c->host || !c->http_url ||
+	    !skip_prefix(c->http_url, "https://", &authority) ||
+	    !dpop_value_valid(c->http_method, "-"))
+		return 0;
+	len = strlen(c->http_url);
+	if (len > CREDENTIAL_DPOP_MAX_VALUE || strchr(authority, '#'))
+		return 0;
+	for (p = c->http_url; *p; p++)
+		if ((unsigned char)*p <= ' ' || (unsigned char)*p >= 127)
+			return 0;
+	len = strcspn(authority, "/?");
+	return len == strlen(c->host) &&
+		!strncasecmp(authority, c->host, len);
+}
+
+static int dpop_credential_valid(const struct credential *c)
+{
+	const char *p;
+	int dots = 0;
+
+	if (c->dpop_invalid ||
+	    !credential_has_capability(&c->capa_dpop, CREDENTIAL_OP_RESPONSE) ||
+	    !credential_has_capability(&c->capa_authtype, CREDENTIAL_OP_RESPONSE) ||
+	    !credential_has_capability(&c->capa_state, CREDENTIAL_OP_RESPONSE) ||
+	    !c->authtype || strcasecmp(c->authtype, "DPoP") ||
+	    !c->ephemeral || c->multistage || c->password ||
+	    c->oauth_refresh_token || c->state_headers.nr != 1 ||
+	    !dpop_request_valid(c) ||
+	    !dpop_value_valid(c->credential, "-._~+/=") ||
+	    !dpop_value_valid(c->dpop, "-_.") ||
+	    !dpop_value_valid(c->state_headers.v[0], "-._~+/:=") ||
+	    c->password_expiry_utc < time(NULL))
+		return 0;
+
+	for (p = c->dpop; *p; p++)
+		if (*p == '.') {
+			if (p == c->dpop || !p[1] || p[1] == '.')
+				return 0;
+			dots++;
+		}
+	return dots == 2;
 }
 
 static void credential_set_capability(struct credential_capability *capa,
@@ -315,6 +399,12 @@ int credential_read(struct credential *c, FILE *fp,
 		    enum credential_op_type op_type)
 {
 	struct strbuf line = STRBUF_INIT;
+	int authtype_seen = 0, credential_seen = 0, dpop_seen = 0;
+	int ephemeral_seen = 0;
+	int authtype_cap = 0, state_cap = 0, dpop_cap = 0;
+	int invalid = 0, selected = 0;
+	int request_dpop = c->capa_dpop.request_initial;
+	size_t state_start = c->state_headers.nr;
 
 	while (strbuf_getline(&line, fp) != EOF) {
 		char *key = line.buf;
@@ -322,6 +412,12 @@ int credential_read(struct credential *c, FILE *fp,
 
 		if (!line.len)
 			break;
+		if (request_dpop &&
+		    (line.len > 65534 || strlen(line.buf) != line.len)) {
+			warning("invalid credential line length");
+			strbuf_release(&line);
+			return -1;
+		}
 
 		if (!value) {
 			warning("invalid credential line: %s", key);
@@ -338,6 +434,9 @@ int credential_read(struct credential *c, FILE *fp,
 			free(c->password);
 			c->password = xstrdup(value);
 		} else if (!strcmp(key, "credential")) {
+			credential_seen++;
+			if (!authtype_cap)
+				invalid = 1;
 			free(c->credential);
 			c->credential = xstrdup(value);
 		} else if (!strcmp(key, "protocol")) {
@@ -350,19 +449,37 @@ int credential_read(struct credential *c, FILE *fp,
 			free(c->path);
 			c->path = xstrdup(value);
 		} else if (!strcmp(key, "ephemeral")) {
+			ephemeral_seen++;
+			c->ephemeral_received = 1;
+			if (!authtype_cap)
+				invalid = 1;
 			c->ephemeral = !!git_config_bool("ephemeral", value);
 		} else if (!strcmp(key, "wwwauth[]")) {
 			strvec_push(&c->wwwauth_headers, value);
 		} else if (!strcmp(key, "state[]")) {
+			if (!state_cap)
+				invalid = 1;
 			strvec_push(&c->state_headers, value);
 		} else if (!strcmp(key, "capability[]")) {
-			if (!strcmp(value, "authtype"))
+			if (!strcmp(value, "authtype")) {
+				authtype_cap = 1;
 				credential_set_capability(&c->capa_authtype, op_type);
-			else if (!strcmp(value, "state"))
+			} else if (!strcmp(value, "state")) {
+				state_cap = 1;
 				credential_set_capability(&c->capa_state, op_type);
+			} else if (!strcmp(value, "dpop")) {
+				if (op_type == CREDENTIAL_OP_INITIAL && !request_dpop)
+					goto unsupported;
+				if (!request_dpop)
+					continue;
+				dpop_cap = 1;
+				credential_set_capability(&c->capa_dpop, op_type);
+			}
 		} else if (!strcmp(key, "continue")) {
+			c->multistage_received = 1;
 			c->multistage = !!git_config_bool("continue", value);
 		} else if (!strcmp(key, "password_expiry_utc")) {
+			c->expiry_received = 1;
 			errno = 0;
 			c->password_expiry_utc = parse_timestamp(value, NULL, 10);
 			if (c->password_expiry_utc == 0 || errno == ERANGE)
@@ -371,8 +488,46 @@ int credential_read(struct credential *c, FILE *fp,
 			free(c->oauth_refresh_token);
 			c->oauth_refresh_token = xstrdup(value);
 		} else if (!strcmp(key, "authtype")) {
+			authtype_seen++;
+			if (request_dpop && !strcasecmp(value, "DPoP"))
+				selected = 1;
+			if (!authtype_cap)
+				invalid = 1;
 			free(c->authtype);
 			c->authtype = xstrdup(value);
+		} else if (!strcmp(key, "dpop")) {
+			if (op_type == CREDENTIAL_OP_INITIAL && !request_dpop)
+				goto unsupported;
+			if (!request_dpop)
+				continue;
+			selected = 1;
+			dpop_seen++;
+			if (!dpop_cap)
+				invalid = 1;
+			free(c->dpop);
+			c->dpop = xstrdup(value);
+		} else if (!strcmp(key, "http-method") ||
+			   !strcmp(key, "http-url")) {
+			if (op_type == CREDENTIAL_OP_INITIAL && !request_dpop)
+				goto unsupported;
+			if (!request_dpop)
+				continue;
+			if (op_type != CREDENTIAL_OP_INITIAL) {
+				invalid = 1;
+			} else if (!strcmp(key, "http-method")) {
+				free(c->http_method);
+				c->http_method = xstrdup(value);
+			} else {
+				free(c->http_url);
+				c->http_url = xstrdup(value);
+			}
+		} else if (!strcmp(key, "http-status") ||
+			   !strcmp(key, "dpop-nonce")) {
+			if (op_type == CREDENTIAL_OP_INITIAL && !request_dpop)
+				goto unsupported;
+			/* These are one-way response observations, not credentials. */
+			if (request_dpop && op_type == CREDENTIAL_OP_HELPER)
+				invalid = 1;
 		} else if (!strcmp(key, "url")) {
 			credential_from_url(c, value);
 		} else if (!strcmp(key, "quit")) {
@@ -385,8 +540,27 @@ int credential_read(struct credential *c, FILE *fp,
 		 */
 	}
 
+	if (request_dpop && op_type == CREDENTIAL_OP_HELPER &&
+	    (dpop_seen || (dpop_cap && selected))) {
+		char *state = NULL;
+
+		if (c->state_headers.nr == state_start + 1)
+			state = xstrdup(c->state_headers.v[state_start]);
+		strvec_clear(&c->state_headers);
+		if (state)
+			strvec_push_nodup(&c->state_headers, state);
+		c->dpop_invalid = invalid || !authtype_cap || !state_cap ||
+			!credential_has_capability(&c->capa_dpop, CREDENTIAL_OP_RESPONSE) ||
+			!dpop_cap || authtype_seen != 1 || credential_seen != 1 ||
+			dpop_seen != 1 || ephemeral_seen != 1 || !state;
+	}
 	strbuf_release(&line);
 	return 0;
+
+unsupported:
+	warning("request-bound DPoP is supported only by the HTTP transport");
+	strbuf_release(&line);
+	return -1;
 }
 
 static void credential_write_item(const struct credential *c,
@@ -413,6 +587,8 @@ void credential_write(const struct credential *c, FILE *fp,
 		credential_write_item(c, fp, "capability[]", "authtype", 0);
 	if (credential_has_capability(&c->capa_state, op_type))
 		credential_write_item(c, fp, "capability[]", "state", 0);
+	if (credential_has_capability(&c->capa_dpop, op_type))
+		credential_write_item(c, fp, "capability[]", "dpop", 0);
 
 	if (credential_has_capability(&c->capa_authtype, op_type)) {
 		credential_write_item(c, fp, "authtype", c->authtype, 0);
@@ -426,6 +602,14 @@ void credential_write(const struct credential *c, FILE *fp,
 	credential_write_item(c, fp, "username", c->username, 0);
 	credential_write_item(c, fp, "password", c->password, 0);
 	credential_write_item(c, fp, "oauth_refresh_token", c->oauth_refresh_token, 0);
+	if (credential_has_capability(&c->capa_dpop, op_type)) {
+		credential_write_item(c, fp, "http-method", c->http_method, 0);
+		credential_write_item(c, fp, "http-url", c->http_url, 0);
+		credential_write_item(c, fp, "dpop", c->dpop, 0);
+		credential_write_item(c, fp, "dpop-nonce", c->dpop_nonce, 0);
+		if (c->http_status >= 0)
+			fprintf(fp, "http-status=%ld\n", c->http_status);
+	}
 	if (c->password_expiry_utc != TIME_MAX) {
 		char *s = xstrfmt("%"PRItime, c->password_expiry_utc);
 		credential_write_item(c, fp, "password_expiry_utc", s, 0);
@@ -441,7 +625,8 @@ void credential_write(const struct credential *c, FILE *fp,
 	}
 }
 
-static int run_credential_helper(struct credential *c,
+static int run_credential_helper(const struct credential *c,
+				 struct credential *response,
 				 const char *cmd,
 				 int want_output)
 {
@@ -468,7 +653,7 @@ static int run_credential_helper(struct credential *c,
 	if (want_output) {
 		int r;
 		fp = xfdopen(helper.out, "r");
-		r = credential_read(c, fp, CREDENTIAL_OP_HELPER);
+		r = credential_read(response, fp, CREDENTIAL_OP_HELPER);
 		fclose(fp);
 		if (r < 0) {
 			finish_command(&helper);
@@ -482,7 +667,7 @@ static int run_credential_helper(struct credential *c,
 }
 
 static int credential_do(struct credential *c, const char *helper,
-			 const char *operation)
+			 const char *operation, struct credential *response)
 {
 	struct strbuf cmd = STRBUF_INIT;
 	int r;
@@ -495,10 +680,147 @@ static int credential_do(struct credential *c, const char *helper,
 		strbuf_addf(&cmd, "git credential-%s", helper);
 
 	strbuf_addf(&cmd, " %s", operation);
-	r = run_credential_helper(c, cmd.buf, !strcmp(operation, "get"));
+	r = run_credential_helper(c, response, cmd.buf, !strcmp(operation, "get"));
 
 	strbuf_release(&cmd);
 	return r;
+}
+
+/*
+ * Copy only lookup/request context. Helper output is always read into a
+ * separate instance, so an earlier password, capability or ephemeral flag
+ * cannot complete or invalidate a later DPoP response. The query sent to a
+ * helper is built separately; see credential_fill_http().
+ */
+static void copy_http_credential_context(struct credential *dst,
+					 const struct credential *src)
+{
+	dst->protocol = xstrdup_or_null(src->protocol);
+	dst->host = xstrdup_or_null(src->host);
+	dst->path = xstrdup_or_null(src->path);
+	dst->username = xstrdup_or_null(src->username);
+	dst->username_from_proto = src->username_from_proto;
+	dst->configured = src->configured;
+	dst->use_http_path = src->use_http_path;
+	dst->sanitize_prompt = src->sanitize_prompt;
+	dst->protect_protocol = src->protect_protocol;
+	credential_set_http_request(dst, src->http_method, src->http_url);
+	for (size_t i = 0; i < src->helpers.nr; i++)
+		string_list_append(&dst->helpers, src->helpers.items[i].string);
+}
+
+static void merge_credential_string(char **dst, char **src)
+{
+	if (*src) {
+		free(*dst);
+		*dst = *src;
+		*src = NULL;
+	}
+}
+
+/*
+ * Ordinary helpers may contribute partial credentials. Merge only after
+ * excluding a DPoP response, which must remain entirely self-contained.
+ */
+static void merge_ordinary_response(struct credential *c,
+				    struct credential *response)
+{
+	if (response->username)
+		c->username_from_proto = response->username_from_proto;
+	merge_credential_string(&c->username, &response->username);
+	merge_credential_string(&c->password, &response->password);
+	merge_credential_string(&c->credential, &response->credential);
+	merge_credential_string(&c->authtype, &response->authtype);
+	merge_credential_string(&c->protocol, &response->protocol);
+	merge_credential_string(&c->host, &response->host);
+	merge_credential_string(&c->path, &response->path);
+	merge_credential_string(&c->oauth_refresh_token, &response->oauth_refresh_token);
+	if (response->ephemeral_received)
+		c->ephemeral = response->ephemeral;
+	if (response->multistage_received)
+		c->multistage = response->multistage;
+	if (response->expiry_received)
+		c->password_expiry_utc = response->password_expiry_utc;
+	c->quit = response->quit;
+	c->capa_authtype.request_helper |= response->capa_authtype.request_helper;
+	c->capa_state.request_helper |= response->capa_state.request_helper;
+	strvec_pushv(&c->state_headers, response->state_headers.v);
+	strvec_pushv(&c->wwwauth_headers, response->wwwauth_headers.v);
+}
+
+static void credential_fill_http(struct repository *r, struct credential *c)
+{
+	credential_apply_config(r, c);
+	if (!c->protect_protocol)
+		die("request-bound authentication requires credential.protectProtocol");
+	if (!dpop_request_valid(c))
+		die("DPoP request URL does not match the HTTPS credential scope");
+
+	credential_next_state(c);
+	c->multistage = 0;
+	for (size_t i = 0; i < c->helpers.nr; i++) {
+		const char *helper = c->helpers.items[i].string;
+		struct credential query = CREDENTIAL_INIT;
+		struct credential response = CREDENTIAL_INIT;
+		int ret;
+
+		if (c->dpop_helper && strcmp(c->dpop_helper, helper))
+			continue;
+		copy_http_credential_context(&query, c);
+		/*
+		 * Query every candidate as a lookup without negotiation would.
+		 * The ordinary partial credential gathered so far, such as a
+		 * refresh token returned with an expired password, is input to
+		 * trusted helpers. Only the response, read below into its own
+		 * instance, is isolated from it.
+		 */
+		query.password = xstrdup_or_null(c->password);
+		query.credential = xstrdup_or_null(c->credential);
+		query.oauth_refresh_token = xstrdup_or_null(c->oauth_refresh_token);
+		query.authtype = xstrdup_or_null(c->authtype);
+		query.ephemeral = c->ephemeral;
+		query.multistage = c->multistage;
+		query.password_expiry_utc = c->password_expiry_utc;
+		strvec_pushv(&query.wwwauth_headers, c->wwwauth_headers.v);
+		strvec_pushv(&query.state_headers_to_send, c->state_headers_to_send.v);
+		copy_http_credential_context(&response, &query);
+		ret = credential_do(&query, helper, "get", &response);
+		credential_clear(&query);
+		if (credential_is_dpop(&response) || response.dpop_invalid ||
+		    c->dpop_helper) {
+			if (ret || !dpop_credential_valid(&response)) {
+				credential_clear(&response);
+				die("invalid DPoP credential response");
+			}
+			response.dpop_helper = xstrdup(helper);
+			strvec_clear(&response.wwwauth_headers);
+			credential_clear(c);
+			*c = response;
+			return;
+		}
+		merge_ordinary_response(c, &response);
+		credential_clear(&response);
+		if (c->password_expiry_utc < time(NULL)) {
+			credential_clear_secrets(c);
+			c->password_expiry_utc = TIME_MAX;
+		}
+		if ((c->username && c->password) || c->credential) {
+			strvec_clear(&c->wwwauth_headers);
+			goto ordinary;
+		}
+		if (c->quit)
+			die("credential helper '%s' told us to quit", helper);
+	}
+	if (c->dpop_helper)
+		die("DPoP credential helper is no longer configured");
+	if (credential_getpass(r, c) ||
+	    (!c->username && !c->password && !c->credential))
+		die("unable to get password from user");
+
+ordinary:
+	memset(&c->capa_dpop, 0, sizeof(c->capa_dpop));
+	FREE_AND_NULL(c->http_method);
+	FREE_AND_NULL(c->http_url);
 }
 
 void credential_fill(struct repository *r,
@@ -506,6 +828,14 @@ void credential_fill(struct repository *r,
 {
 	int i;
 
+	if (credential_is_dpop(c))
+		die("refusing to reuse a DPoP proof");
+	if (c->capa_dpop.request_initial) {
+		if (c->dpop)
+			die("refusing to reuse a DPoP proof");
+		credential_fill_http(r, c);
+		return;
+	}
 	if ((c->username && c->password) || c->credential)
 		return;
 
@@ -517,7 +847,7 @@ void credential_fill(struct repository *r,
 		credential_set_all_capabilities(c, CREDENTIAL_OP_INITIAL);
 
 	for (i = 0; i < c->helpers.nr; i++) {
-		credential_do(c, c->helpers.items[i].string, "get");
+		credential_do(c, c->helpers.items[i].string, "get", c);
 
 		if (c->password_expiry_utc < time(NULL)) {
 			/*
@@ -548,6 +878,10 @@ void credential_approve(struct repository *r, struct credential *c)
 {
 	int i;
 
+	if (credential_is_dpop(c) || c->dpop_helper || c->dpop_invalid) {
+		credential_clear_secrets(c);
+		return;
+	}
 	if (c->approved)
 		return;
 	if (((!c->username || !c->password) && !c->credential) || c->password_expiry_utc < time(NULL))
@@ -558,7 +892,7 @@ void credential_approve(struct repository *r, struct credential *c)
 	credential_apply_config(r, c);
 
 	for (i = 0; i < c->helpers.nr; i++)
-		credential_do(c, c->helpers.items[i].string, "store");
+		credential_do(c, c->helpers.items[i].string, "store", NULL);
 	c->approved = 1;
 }
 
@@ -566,18 +900,41 @@ void credential_reject(struct repository *r, struct credential *c)
 {
 	int i;
 
+	if (credential_is_dpop(c) || c->dpop_helper || c->dpop_invalid) {
+		credential_clear_secrets(c);
+		return;
+	}
 	credential_next_state(c);
 
 	credential_apply_config(r, c);
 
 	for (i = 0; i < c->helpers.nr; i++)
-		credential_do(c, c->helpers.items[i].string, "erase");
+		credential_do(c, c->helpers.items[i].string, "erase", NULL);
 
 	credential_clear_secrets(c);
 	FREE_AND_NULL(c->username);
 	FREE_AND_NULL(c->oauth_refresh_token);
 	c->password_expiry_utc = TIME_MAX;
 	c->approved = 0;
+}
+
+int credential_dpop_observe(struct credential *c, long status)
+{
+	int ret;
+
+	if (!c->dpop_helper)
+		return 0;
+	credential_clear_secrets(c);
+	if (!status) {
+		FREE_AND_NULL(c->dpop_nonce);
+		strvec_clear(&c->wwwauth_headers);
+	}
+	c->http_status = status;
+	credential_next_state(c);
+	ret = credential_do(c, c->dpop_helper, "observe", NULL);
+	if (ret)
+		warning(_("DPoP response bookkeeping failed"));
+	return ret;
 }
 
 static int check_url_component(const char *url, int quiet,

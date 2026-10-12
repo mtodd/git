@@ -172,10 +172,17 @@ struct credential {
 		 use_http_path:1,
 		 username_from_proto:1,
 		 sanitize_prompt:1,
-		 protect_protocol:1;
+		 protect_protocol:1,
+		 dpop_invalid:1;
+
+	/* Presence flags for merging isolated ordinary helper responses. */
+	unsigned ephemeral_received:1,
+		 multistage_received:1,
+		 expiry_received:1;
 
 	struct credential_capability capa_authtype;
 	struct credential_capability capa_state;
+	struct credential_capability capa_dpop;
 
 	char *username;
 	char *password;
@@ -191,7 +198,22 @@ struct credential {
 	 * negotiate any scheme it likes.
 	 */
 	char *authtype;
+
+	/*
+	 * Unlike path, http_url describes one request, not a credential
+	 * lookup scope. It must not be affected by credential.useHttpPath.
+	 */
+	char *http_method;
+	char *http_url;
+	long http_status;
+	char *dpop;
+	char *dpop_nonce;
+
+	/* Private routing information; never read from or written to helpers. */
+	char *dpop_helper;
 };
+
+#define CREDENTIAL_DPOP_MAX_VALUE 16384
 
 #define CREDENTIAL_INIT { \
 	.helpers = STRING_LIST_INIT_DUP, \
@@ -201,6 +223,7 @@ struct credential {
 	.state_headers_to_send = STRVEC_INIT, \
 	.sanitize_prompt = 1, \
 	.protect_protocol = 1, \
+	.http_status = -1, \
 }
 
 /* Initialize a credential structure, setting all fields to empty. */
@@ -221,8 +244,9 @@ void credential_clear(struct credential *);
  * guaranteed to be non-NULL. If an error occurs, the function
  * will die().
  *
- * If all_capabilities is set, this is an internal user that is prepared
- * to deal with all known capabilities, and we should advertise that fact.
+ * If all_capabilities is set, advertise all generic credential capabilities.
+ * Request-bound HTTP authentication is enabled separately by
+ * credential_set_http_request().
  */
 void credential_fill(struct repository *, struct credential *,
 		     int all_capabilities);
@@ -261,6 +285,27 @@ void credential_set_all_capabilities(struct credential *c,
  * stage of filling.
  */
 void credential_clear_secrets(struct credential *c);
+
+int credential_is_dpop(const struct credential *c);
+
+/*
+ * Enable the HTTP-only request-bound exchange for this credential and set
+ * its request target. This is not part of the generic credential CLI.
+ * Unlike an ordinary lookup, the exchange does not return early for a
+ * complete credential: a caller which already has one should not call
+ * credential_fill() for it.
+ */
+void credential_set_http_request(struct credential *c, const char *method,
+				 const char *url);
+
+/*
+ * Notify only the helper that prepared this attempt. Status zero signals
+ * abandonment, with no nonce/challenge metadata. It is not an SDK HTTP status.
+ * Secrets are removed before writing.
+ * Warn and return nonzero on bookkeeping failure. The caller must retain the
+ * original transfer result and must not authorize a nonce retry on failure.
+ */
+int credential_dpop_observe(struct credential *c, long status);
 
 /**
  * Print a list of supported capabilities and version numbers to standard

@@ -17,6 +17,7 @@ static struct test_cmd cmds[] = {
 	{ "cache-tree", cmd__cache_tree },
 	{ "chmtime", cmd__chmtime },
 	{ "config", cmd__config },
+	{ "credential-http", cmd__credential_http },
 	{ "crontab", cmd__crontab },
 	{ "csprng", cmd__csprng },
 	{ "date", cmd__date },

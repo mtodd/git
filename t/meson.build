@@ -142,6 +142,7 @@ integration_tests = [
   't0301-credential-cache.sh',
   't0302-credential-store.sh',
   't0303-credential-external.sh',
+  't0304-credential-dpop.sh',
   't0410-partial-clone.sh',
   't0411-clone-from-partial.sh',
   't0450-txt-doc-vs-help.sh',
