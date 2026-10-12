@@ -328,23 +328,28 @@ static struct curl_slist *object_request_headers(void)
 	return curl_slist_append(http_copy_default_headers(), "Pragma:");
 }
 
-static void clear_slot_headers(struct active_request_slot *slot)
+static void clear_slot_request(struct active_request_slot *slot)
 {
 	if (slot->curl && slot->request_headers)
 		curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, NULL);
 	curl_slist_free_all(slot->request_headers);
 	slot->request_headers = NULL;
+	FREE_AND_NULL(slot->request_method);
+	FREE_AND_NULL(slot->request_url);
 }
 
-void http_set_request_headers(struct active_request_slot *slot,
-			      const struct curl_slist *headers)
+void http_set_request(struct active_request_slot *slot, const char *method,
+		      const char *url, const struct curl_slist *headers)
 {
-	clear_slot_headers(slot);
+	clear_slot_request(slot);
+	slot->request_method = xstrdup(method);
+	slot->request_url = xstrdup(url);
 	if (!headers)
 		headers = pragma_header;
 	for (; headers; headers = headers->next)
 		slot->request_headers = curl_slist_append(slot->request_headers,
 							 headers->data);
+	curl_easy_setopt(slot->curl, CURLOPT_URL, slot->request_url);
 	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, slot->request_headers);
 }
 
@@ -376,7 +381,7 @@ static void finish_active_slot(struct active_request_slot *slot)
 	}
 
 	credential_clear(&slot->auth);
-	clear_slot_headers(slot);
+	clear_slot_request(slot);
 
 	/* Run callback if appropriate */
 	if (slot->callback_func)
@@ -1547,7 +1552,7 @@ void http_cleanup(void)
 		struct active_request_slot *next = slot->next;
 		if (slot->curl)
 			xmulti_remove_handle(slot);
-		clear_slot_headers(slot);
+		clear_slot_request(slot);
 		if (slot->curl) {
 			curl_easy_cleanup(slot->curl);
 		}
@@ -1706,7 +1711,7 @@ int start_active_slot(struct active_request_slot *slot)
 		active_requests--;
 		slot->in_use = 0;
 		credential_clear(&slot->auth);
-		clear_slot_headers(slot);
+		clear_slot_request(slot);
 		return 0;
 	}
 
@@ -1857,7 +1862,7 @@ static void release_active_slot(struct active_request_slot *slot)
 	closedown_active_slot(slot);
 	if (slot->curl)
 		xmulti_remove_handle(slot);
-	clear_slot_headers(slot);
+	clear_slot_request(slot);
 	if (slot->curl) {
 		if (curl_session_count > min_curl_sessions) {
 			curl_easy_cleanup(slot->curl);
@@ -2314,8 +2319,7 @@ static int http_request(const char *url,
 
 	headers = http_append_auth_header(&http_auth, headers);
 
-	curl_easy_setopt(slot->curl, CURLOPT_URL, url);
-	http_set_request_headers(slot, headers);
+	http_set_request(slot, result ? "GET" : "HEAD", url, headers);
 	curl_easy_setopt(slot->curl, CURLOPT_ENCODING, "");
 	curl_easy_setopt(slot->curl, CURLOPT_FAILONERROR, 0L);
 
@@ -2817,8 +2821,7 @@ struct http_pack_request *new_direct_http_pack_request(
 	preq->headers = object_request_headers();
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq->packfile);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
-	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
-	http_set_request_headers(preq->slot, preq->headers);
+	http_set_request(preq->slot, "GET", preq->url, preq->headers);
 
 	if (prev_posn > 0) {
 		if (http_is_verbose)
@@ -2987,8 +2990,7 @@ struct http_object_request *new_http_object_request(const char *base_url,
 	curl_easy_setopt(freq->slot->curl, CURLOPT_FAILONERROR, 0L);
 	curl_easy_setopt(freq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_sha1_file);
 	curl_easy_setopt(freq->slot->curl, CURLOPT_ERRORBUFFER, freq->errorstr);
-	curl_easy_setopt(freq->slot->curl, CURLOPT_URL, freq->url);
-	http_set_request_headers(freq->slot, freq->headers);
+	http_set_request(freq->slot, "GET", freq->url, freq->headers);
 
 	/*
 	 * If we have successfully processed data from a previous fetch

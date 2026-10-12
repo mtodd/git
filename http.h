@@ -36,6 +36,8 @@ struct active_request_slot {
 	struct active_request_slot *next;
 	struct credential auth;
 	struct curl_slist *request_headers;
+	char *request_method;
+	char *request_url;
 };
 
 struct buffer {
@@ -51,8 +53,9 @@ int seek_buffer(void *clientp, curl_off_t offset, int origin);
 
 /* Slot lifecycle functions */
 struct active_request_slot *get_active_slot(void);
-void http_set_request_headers(struct active_request_slot *slot,
-			      const struct curl_slist *headers);
+/* Bind one transfer's context and owned headers before activating its slot. */
+void http_set_request(struct active_request_slot *slot, const char *method,
+		      const char *url, const struct curl_slist *headers);
 int start_active_slot(struct active_request_slot *slot);
 void run_active_slot(struct active_request_slot *slot);
 void finish_all_active_slots(void);
