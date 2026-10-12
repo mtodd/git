@@ -217,10 +217,11 @@ static inline int is_hdr_continuation(const char *ptr, const size_t size)
 	return size && (*ptr == ' ' || *ptr == '\t');
 }
 
-static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p MAYBE_UNUSED)
+static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p)
 {
 	size_t size = eltsize * nmemb;
-	struct strvec *values = &http_auth.wwwauth_headers;
+	struct credential *auth = p;
+	struct strvec *values = &auth->wwwauth_headers;
 	struct strbuf buf = STRBUF_INIT;
 	const char *val;
 	size_t val_len;
@@ -261,7 +262,7 @@ static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p MA
 		strbuf_trim(&buf);
 
 		strvec_push(values, buf.buf);
-		http_auth.header_is_last_match = 1;
+		auth->header_is_last_match = 1;
 		goto exit;
 	}
 
@@ -270,7 +271,7 @@ static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p MA
 	 * field. If this is the case then we should append this value to the
 	 * end of the previously consumed value.
 	 */
-	if (http_auth.header_is_last_match && is_hdr_continuation(ptr, size)) {
+	if (auth->header_is_last_match && is_hdr_continuation(ptr, size)) {
 		/*
 		 * Trim the CRLF and any leading or trailing from this line.
 		 */
@@ -299,7 +300,7 @@ static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p MA
 	}
 
 	/* Not a continuation of a previously matched auth header line. */
-	http_auth.header_is_last_match = 0;
+	auth->header_is_last_match = 0;
 
 	/*
 	 * If this is a HTTP status line and not a header field, this signals
@@ -337,6 +338,8 @@ static void finish_active_slot(struct active_request_slot *slot)
 {
 	closedown_active_slot(slot);
 	curl_easy_getinfo(slot->curl, CURLINFO_HTTP_CODE, &slot->http_code);
+	strvec_clear(&http_auth.wwwauth_headers);
+	strvec_pushv(&http_auth.wwwauth_headers, slot->auth.wwwauth_headers.v);
 
 	if (slot->finished)
 		(*slot->finished) = 1;
@@ -351,6 +354,8 @@ static void finish_active_slot(struct active_request_slot *slot)
 		curl_easy_getinfo(slot->curl, CURLINFO_HTTP_CONNECTCODE,
 			&slot->results->http_connectcode);
 	}
+
+	credential_clear(&slot->auth);
 
 	/* Run callback if appropriate */
 	if (slot->callback_func)
@@ -1523,6 +1528,7 @@ void http_cleanup(void)
 			xmulti_remove_handle(slot);
 			curl_easy_cleanup(slot->curl);
 		}
+		credential_clear(&slot->auth);
 		free(slot);
 		slot = next;
 	}
@@ -1590,7 +1596,8 @@ struct active_request_slot *get_active_slot(void)
 		slot = slot->next;
 
 	if (!slot) {
-		newslot = xmalloc(sizeof(*newslot));
+		CALLOC_ARRAY(newslot, 1);
+		credential_init(&newslot->auth);
 		newslot->curl = NULL;
 		newslot->in_use = 0;
 		newslot->next = NULL;
@@ -1637,6 +1644,8 @@ struct active_request_slot *get_active_slot(void)
 	curl_easy_setopt(slot->curl, CURLOPT_CUSTOMREQUEST, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_READFUNCTION, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
+	curl_easy_setopt(slot->curl, CURLOPT_HEADERDATA, &slot->auth);
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, -1L);
 	curl_easy_setopt(slot->curl, CURLOPT_UPLOAD, 0L);
@@ -1673,6 +1682,7 @@ int start_active_slot(struct active_request_slot *slot)
 			curl_multi_strerror(curlm_result));
 		active_requests--;
 		slot->in_use = 0;
+		credential_clear(&slot->auth);
 		return 0;
 	}
 
@@ -1829,6 +1839,7 @@ static void release_active_slot(struct active_request_slot *slot)
 			curl_session_count--;
 		}
 	}
+	credential_clear(&slot->auth);
 	fill_active_slots();
 }
 
@@ -2253,8 +2264,6 @@ static int http_request(const char *url,
 			curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION,
 					 fwrite_buffer);
 	}
-
-	curl_easy_setopt(slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
 
 	accept_language = http_get_accept_language_header();
 

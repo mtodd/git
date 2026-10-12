@@ -12,6 +12,7 @@ struct packfile_list;
 #include "gettext.h"
 #include "strbuf.h"
 #include "remote.h"
+#include "credential.h"
 
 #define DEFAULT_MAX_REQUESTS 5
 
@@ -33,6 +34,7 @@ struct active_request_slot {
 	void *callback_data;
 	void (*callback_func)(void *data);
 	struct active_request_slot *next;
+	struct credential auth;
 };
 
 struct buffer {
