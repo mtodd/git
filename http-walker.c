@@ -225,7 +225,7 @@ static void process_alternates_response(void *callback_data)
 			strbuf_reset(alt_req->url);
 			strbuf_addf(alt_req->url, "%s/objects/info/alternates",
 				    base);
-			http_set_request(slot, "GET", alt_req->url->buf, NULL);
+			http_set_request(slot, "GET", alt_req->url->buf, NULL, 0);
 			active_requests++;
 			slot->in_use = 1;
 			if (slot->finished)
@@ -380,7 +380,7 @@ static void fetch_alternates(struct walker *walker, const char *base)
 
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEDATA, &buffer);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, fwrite_buffer);
-	http_set_request(slot, "GET", url.buf, NULL);
+	http_set_request(slot, "GET", url.buf, NULL, 0);
 
 	alt_req.base = base;
 	alt_req.url = &url;

@@ -123,6 +123,9 @@ static const char *curl_proxyuserpwd;
 static char *curl_cookie_file;
 static int curl_save_cookies;
 struct credential http_auth = CREDENTIAL_INIT;
+static int http_auth_needs_fill;
+static int http_auth_fill_capabilities;
+static int http_dpop;
 static enum proactive_auth http_proactive_auth;
 static char *user_agent;
 static int curl_empty_auth = -1;
@@ -217,6 +220,18 @@ static inline int is_hdr_continuation(const char *ptr, const size_t size)
 	return size && (*ptr == ' ' || *ptr == '\t');
 }
 
+static int http_auth_value_valid(const char *value)
+{
+	size_t len = strlen(value);
+
+	if (len > CREDENTIAL_DPOP_MAX_VALUE)
+		return 0;
+	for (; *value; value++)
+		if ((unsigned char)*value < ' ' || (unsigned char)*value >= 127)
+			return 0;
+	return 1;
+}
+
 static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p)
 {
 	size_t size = eltsize * nmemb;
@@ -225,6 +240,10 @@ static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p)
 	struct strbuf buf = STRBUF_INIT;
 	const char *val;
 	size_t val_len;
+
+	if (auth->dpop_helper &&
+	    (size > CREDENTIAL_DPOP_MAX_VALUE || is_hdr_continuation(ptr, size)))
+		goto invalid;
 
 	/*
 	 * Header lines may not come NULL-terminated from libcurl so we must
@@ -261,8 +280,24 @@ static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p)
 		 */
 		strbuf_trim(&buf);
 
+		if (auth->dpop_helper &&
+		    (buf.len != strlen(buf.buf) ||
+		     !http_auth_value_valid(buf.buf) || values->nr >= 16))
+			goto invalid;
 		strvec_push(values, buf.buf);
 		auth->header_is_last_match = 1;
+		goto exit;
+	}
+
+	if (auth->dpop_helper &&
+	    skip_iprefix_mem(ptr, size, "dpop-nonce:", &val, &val_len)) {
+		strbuf_add(&buf, val, val_len);
+		strbuf_trim(&buf);
+		if (!buf.len || buf.len != strlen(buf.buf) || auth->dpop_nonce ||
+		    !http_auth_value_valid(buf.buf) || strchr(buf.buf, ' '))
+			goto invalid;
+		auth->dpop_nonce = strbuf_detach(&buf, NULL);
+		auth->header_is_last_match = 0;
 		goto exit;
 	}
 
@@ -309,12 +344,102 @@ static size_t fwrite_wwwauth(char *ptr, size_t eltsize, size_t nmemb, void *p)
 	 * We only care about the last HTTP request response's headers so clear
 	 * the existing array.
 	 */
-	if (skip_iprefix_mem(ptr, size, "http/", &val, &val_len))
+	if (skip_iprefix_mem(ptr, size, "http/", &val, &val_len)) {
 		strvec_clear(values);
+		FREE_AND_NULL(auth->dpop_nonce);
+	}
 
 exit:
 	strbuf_release(&buf);
 	return size;
+
+invalid:
+	strbuf_release(&buf);
+	FREE_AND_NULL(auth->dpop_nonce);
+	strvec_clear(&auth->wwwauth_headers);
+	auth->dpop_invalid = 1;
+	return 0;
+}
+
+/*
+ * A comma starts another challenge if the following token is not an
+ * auth-param name (which is followed by '='). Do not search inside quoted
+ * strings: another scheme's description may mention use_dpop_nonce.
+ */
+static int has_dpop_nonce_challenge(const struct strvec *headers)
+{
+	struct strbuf unquoted = STRBUF_INIT;
+	int found = 0;
+
+	for (size_t i = 0; i < headers->nr; i++) {
+		const char *p = headers->v[i];
+		int dpop = 0;
+
+		while (*p) {
+			const char *name, *value;
+			size_t namelen, valuelen;
+
+			while (*p == ' ' || *p == '\t' || *p == ',')
+				p++;
+			name = p;
+			while (*p && (isalnum((unsigned char)*p) ||
+				      strchr("!#$%&'*+-.^_`|~", *p)))
+				p++;
+			namelen = p - name;
+			if (!namelen)
+				break;
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (*p != '=') {
+				dpop = namelen == 4 && !strncasecmp(name, "DPoP", 4);
+				continue;
+			}
+			p++;
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (*p == '"') {
+				strbuf_reset(&unquoted);
+				p++;
+				while (*p && *p != '"') {
+					if (*p == '\\') {
+						p++;
+						if (!*p)
+							break;
+					}
+					strbuf_addch(&unquoted, *p++);
+				}
+				if (*p != '"')
+					break;
+				p++;
+				value = unquoted.buf;
+				valuelen = unquoted.len;
+			} else {
+				value = p;
+				while (*p && *p != ',' && *p != ' ' && *p != '\t')
+					p++;
+				valuelen = p - value;
+			}
+			if (dpop && namelen == 5 && !strncasecmp(name, "error", 5) &&
+			    valuelen == 14 && !memcmp(value, "use_dpop_nonce", 14)) {
+				found = 1;
+				goto done;
+			}
+		}
+	}
+done:
+	strbuf_release(&unquoted);
+	return found;
+}
+
+static void clear_slot_request(struct active_request_slot *slot)
+{
+	if (slot->curl && slot->request_headers)
+		curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, NULL);
+	curl_slist_free_all(slot->request_headers);
+	slot->request_headers = NULL;
+	credential_clear(&slot->auth);
+	FREE_AND_NULL(slot->request_method);
+	FREE_AND_NULL(slot->request_url);
 }
 
 size_t fwrite_null(char *ptr UNUSED, size_t eltsize UNUSED, size_t nmemb,
@@ -328,31 +453,6 @@ static struct curl_slist *object_request_headers(void)
 	return curl_slist_append(http_copy_default_headers(), "Pragma:");
 }
 
-static void clear_slot_request(struct active_request_slot *slot)
-{
-	if (slot->curl && slot->request_headers)
-		curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, NULL);
-	curl_slist_free_all(slot->request_headers);
-	slot->request_headers = NULL;
-	FREE_AND_NULL(slot->request_method);
-	FREE_AND_NULL(slot->request_url);
-}
-
-void http_set_request(struct active_request_slot *slot, const char *method,
-		      const char *url, const struct curl_slist *headers)
-{
-	clear_slot_request(slot);
-	slot->request_method = xstrdup(method);
-	slot->request_url = xstrdup(url);
-	if (!headers)
-		headers = pragma_header;
-	for (; headers; headers = headers->next)
-		slot->request_headers = curl_slist_append(slot->request_headers,
-							 headers->data);
-	curl_easy_setopt(slot->curl, CURLOPT_URL, slot->request_url);
-	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, slot->request_headers);
-}
-
 static void closedown_active_slot(struct active_request_slot *slot)
 {
 	active_requests--;
@@ -363,8 +463,20 @@ static void finish_active_slot(struct active_request_slot *slot)
 {
 	closedown_active_slot(slot);
 	curl_easy_getinfo(slot->curl, CURLINFO_HTTP_CODE, &slot->http_code);
-	strvec_clear(&http_auth.wwwauth_headers);
-	strvec_pushv(&http_auth.wwwauth_headers, slot->auth.wwwauth_headers.v);
+
+	if (slot->dpop) {
+		slot->dpop_nonce = !slot->auth.dpop_invalid &&
+			slot->http_code == 401 && slot->auth.dpop_nonce &&
+			(slot->curl_result == CURLE_OK ||
+			 slot->curl_result == CURLE_HTTP_RETURNED_ERROR) &&
+			has_dpop_nonce_challenge(&slot->auth.wwwauth_headers);
+		if (credential_dpop_observe(&slot->auth, slot->http_code))
+			slot->dpop_nonce = 0;
+	} else {
+		strvec_clear(&http_auth.wwwauth_headers);
+		strvec_pushv(&http_auth.wwwauth_headers,
+			     slot->auth.wwwauth_headers.v);
+	}
 
 	if (slot->finished)
 		(*slot->finished) = 1;
@@ -373,6 +485,8 @@ static void finish_active_slot(struct active_request_slot *slot)
 	if (slot->results) {
 		slot->results->curl_result = slot->curl_result;
 		slot->results->http_code = slot->http_code;
+		slot->results->dpop = slot->dpop;
+		slot->results->dpop_nonce = slot->dpop_nonce;
 		curl_easy_getinfo(slot->curl, CURLINFO_HTTPAUTH_AVAIL,
 				  &slot->results->auth_avail);
 
@@ -380,7 +494,6 @@ static void finish_active_slot(struct active_request_slot *slot)
 			&slot->results->http_connectcode);
 	}
 
-	credential_clear(&slot->auth);
 	clear_slot_request(slot);
 
 	/* Run callback if appropriate */
@@ -424,6 +537,10 @@ static void process_curl_messages(void)
 static int http_options(const char *var, const char *value,
 			const struct config_context *ctx, void *data)
 {
+	if (!strcmp("http.dpop", var)) {
+		http_dpop = git_config_bool(var, value);
+		return 0;
+	}
 	if (!strcmp("http.version", var)) {
 		return git_config_string(&curl_http_version, var, value);
 	}
@@ -666,8 +783,23 @@ struct curl_slist *http_append_auth_header(const struct credential *c,
 	return headers;
 }
 
+/*
+ * A complete ordinary credential, such as one given in the URL, needs no
+ * lookup: credential_fill() returns without consulting any helper for it.
+ */
+static int http_auth_complete(void)
+{
+	return http_auth.credential ||
+		(http_auth.username && http_auth.password);
+}
+
 static void init_curl_http_auth(CURL *result)
 {
+	if (http_auth.dpop_helper)
+		return;
+	/* Defer an incomplete credential's lookup to prepare_slot_auth(). */
+	if (http_dpop && !http_auth.configured && !http_auth_complete())
+		return;
 	if ((!http_auth.username || !*http_auth.username) &&
 	    (!http_auth.credential || !*http_auth.credential)) {
 		if (!always_auth_proactively() && curl_empty_auth_enabled()) {
@@ -675,12 +807,14 @@ static void init_curl_http_auth(CURL *result)
 			return;
 		} else if (!always_auth_proactively()) {
 			return;
-		} else if (http_proactive_auth == PROACTIVE_AUTH_BASIC) {
+		} else if (!http_dpop &&
+			   http_proactive_auth == PROACTIVE_AUTH_BASIC) {
 			strvec_push(&http_auth.wwwauth_headers, "Basic");
 		}
 	}
 
-	credential_fill(the_repository, &http_auth, 1);
+	if (!http_dpop)
+		credential_fill(the_repository, &http_auth, 1);
 
 	if (http_auth.password) {
 		if (always_auth_proactively()) {
@@ -710,7 +844,212 @@ void http_reauth_prepare(int all_capabilities)
 	    (http_auth_methods & CURLAUTH_GSSNEGOTIATE))
 		return;
 
-	credential_fill(the_repository, &http_auth, all_capabilities);
+	if (http_dpop) {
+		http_auth_needs_fill = 1;
+		http_auth_fill_capabilities = all_capabilities;
+	} else {
+		credential_fill(the_repository, &http_auth, all_capabilities);
+	}
+}
+
+int http_is_dpop(void)
+{
+	return !!http_auth.dpop_helper;
+}
+
+static int dpop_url_config(const char *var, const char *value,
+			   const struct config_context *ctx UNUSED, void *data)
+{
+	if (!strcmp(var, "http.dpop"))
+		*(int *)data = git_config_bool(var, value);
+	return 0;
+}
+
+static int dpop_enabled_for_url(const char *url)
+{
+	struct urlmatch_config config = URLMATCH_CONFIG_INIT;
+	char *normalized;
+	int enabled = 0;
+
+	if (!http_dpop)
+		return 0;
+	config.section = "http";
+	config.key = "dpop";
+	config.collect_fn = dpop_url_config;
+	config.cb = &enabled;
+	normalized = url_normalize(url, &config.url);
+	if (normalized)
+		repo_config(the_repository, urlmatch_config_entry, &config);
+	free(normalized);
+	urlmatch_config_release(&config);
+	return enabled;
+}
+
+static void copy_dpop_context(struct credential *dst,
+			      const struct credential *src)
+{
+	dst->protocol = xstrdup_or_null(src->protocol);
+	dst->host = xstrdup_or_null(src->host);
+	dst->path = xstrdup_or_null(src->path);
+	dst->username = xstrdup_or_null(src->username);
+	dst->dpop_helper = xstrdup(src->dpop_helper);
+	dst->configured = src->configured;
+	dst->use_http_path = src->use_http_path;
+	dst->sanitize_prompt = src->sanitize_prompt;
+	dst->protect_protocol = src->protect_protocol;
+	for (size_t i = 0; i < src->helpers.nr; i++)
+		string_list_append(&dst->helpers, src->helpers.items[i].string);
+}
+
+void http_set_request(struct active_request_slot *slot, const char *method,
+		      const char *url, const struct curl_slist *headers,
+		      int append_auth_header)
+{
+	if (slot->auth.dpop_helper)
+		BUG("replacing an unobserved DPoP request");
+	clear_slot_request(slot);
+	slot->request_method = xstrdup(method);
+	slot->request_url = xstrdup(url);
+	slot->append_auth_header = append_auth_header;
+	if (!headers)
+		headers = pragma_header;
+	for (; headers; headers = headers->next)
+		slot->request_headers = curl_slist_append(slot->request_headers,
+							 headers->data);
+	curl_easy_setopt(slot->curl, CURLOPT_URL, slot->request_url);
+}
+
+static int prepare_slot_auth(struct active_request_slot *slot)
+{
+	struct strbuf proof = STRBUF_INIT;
+	struct curl_slist *header;
+	int enabled = slot->request_url &&
+		dpop_enabled_for_url(slot->request_url);
+
+	slot->dpop = slot->dpop_nonce = 0;
+	if (http_dpop && !slot->request_url)
+		return error(_("DPoP does not support unbound HTTP operations"));
+	if (!enabled) {
+		if (http_is_dpop())
+			return error("DPoP request is outside the enabled HTTP scope");
+		if (http_auth_needs_fill) {
+			credential_fill(the_repository, &http_auth,
+					http_auth_fill_capabilities);
+			http_auth_needs_fill = 0;
+		}
+		goto ordinary;
+	}
+
+	{
+		char *target = transport_anonymize_url(slot->request_url);
+
+		free(slot->request_url);
+		slot->request_url = target;
+		curl_easy_setopt(slot->curl, CURLOPT_URL, target);
+	}
+	if (http_is_dpop()) {
+		copy_dpop_context(&slot->auth, &http_auth);
+		credential_set_http_request(&slot->auth, slot->request_method,
+					   slot->request_url);
+		credential_fill(the_repository, &slot->auth, 1);
+	} else if (!http_auth_complete() &&
+		   (http_auth_needs_fill || always_auth_proactively() ||
+		    http_auth.username)) {
+		/*
+		 * The helper may select a one-request credential. Fill the
+		 * slot, and promote only ordinary credentials to http_auth.
+		 */
+		credential_clear(&slot->auth);
+		slot->auth = http_auth;
+		credential_init(&http_auth);
+		credential_set_http_request(&slot->auth, slot->request_method,
+					   slot->request_url);
+		/*
+		 * As without opt-in, only a lookup without a username assumes
+		 * Basic.
+		 */
+		if (http_proactive_auth == PROACTIVE_AUTH_BASIC &&
+		    (!slot->auth.username || !*slot->auth.username) &&
+		    !slot->auth.wwwauth_headers.nr)
+			strvec_push(&slot->auth.wwwauth_headers, "Basic");
+		credential_fill(the_repository, &slot->auth, 1);
+		if (credential_is_dpop(&slot->auth)) {
+			copy_dpop_context(&http_auth, &slot->auth);
+		} else {
+			http_auth = slot->auth;
+			credential_init(&slot->auth);
+		}
+	}
+	http_auth_needs_fill = 0;
+
+	if (!slot->auth.dpop_helper)
+		goto ordinary;
+
+	slot->dpop = 1;
+	if (!curl_ssl_verify)
+		return error("DPoP requires TLS certificate verification");
+	for (header = slot->request_headers; header; header = header->next) {
+		const char *colon = strchr(header->data, ':');
+		const char *semicolon = strchr(header->data, ';');
+		size_t namelen;
+
+		if (!http_auth_value_valid(header->data) ||
+		    (!colon && !semicolon))
+			return error("invalid HTTP header for a DPoP request");
+		namelen = strcspn(header->data, ":;");
+		if (!namelen)
+			return error("invalid HTTP header name for a DPoP request");
+		for (size_t i = 0; i < namelen; i++)
+			if (!isalnum((unsigned char)header->data[i]) &&
+			    !strchr("!#$%&'*+-.^_`|~", header->data[i]))
+				return error("invalid HTTP header name for a DPoP request");
+		if (!strncasecmp(header->data, "Authorization:", 14) ||
+		    !strncasecmp(header->data, "Authorization;", 14) ||
+		    !strncasecmp(header->data, "DPoP:", 5) ||
+		    !strncasecmp(header->data, "DPoP;", 5) ||
+		    !strncasecmp(header->data, "Host:", 5) ||
+		    !strncasecmp(header->data, "Host;", 5))
+			return error("DPoP conflicts with a configured authentication header");
+		if (namelen == 6 && !strncasecmp(header->data, "Expect", 6) &&
+		    strcmp(header->data + namelen, ":"))
+			return error("DPoP does not support Expect negotiation");
+	}
+
+	/*
+	 * libcurl must not resend a proof behind our back: neither redirects,
+	 * authentication negotiation, stale connection retries, nor HTTP/2
+	 * stream retries are appropriate for a one-request credential.
+	 */
+	curl_easy_setopt(slot->curl, CURLOPT_FOLLOWLOCATION, 0L);
+	curl_easy_setopt(slot->curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_NONE);
+	curl_easy_setopt(slot->curl, CURLOPT_USERNAME, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_PASSWORD, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_NETRC, (long)CURL_NETRC_IGNORED);
+	curl_easy_setopt(slot->curl, CURLOPT_HEADEROPT, (long)CURLHEADER_SEPARATE);
+	curl_easy_setopt(slot->curl, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
+	curl_easy_setopt(slot->curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+	curl_easy_setopt(slot->curl, CURLOPT_FRESH_CONNECT, 1L);
+	curl_easy_setopt(slot->curl, CURLOPT_FORBID_REUSE, 1L);
+	curl_easy_setopt(slot->curl, CURLOPT_PATH_AS_IS, 1L);
+	/* A 417 can make libcurl resend a request with the same custom headers. */
+	slot->request_headers = curl_slist_append(slot->request_headers, "Expect:");
+	slot->request_headers = http_append_auth_header(&slot->auth,
+						       slot->request_headers);
+	strbuf_addf(&proof, "DPoP: %s", slot->auth.dpop);
+	slot->request_headers = curl_slist_append(slot->request_headers, proof.buf);
+	strbuf_release(&proof);
+	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, slot->request_headers);
+	return 0;
+
+ordinary:
+	init_curl_http_auth(slot->curl);
+	if (!slot->request_url)
+		return 0;
+	if (slot->append_auth_header)
+		slot->request_headers = http_append_auth_header(&http_auth,
+							       slot->request_headers);
+	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, slot->request_headers);
+	return 0;
 }
 
 /* *var must be free-able */
@@ -863,7 +1202,11 @@ static int redact_sensitive_header(struct strbuf *header, size_t offset)
 	int ret = 0;
 	char *sensitive_header;
 
-	if (trace_curl_redact &&
+	if (skip_iprefix(header->buf + offset, "DPoP:", &sensitive_header)) {
+		strbuf_setlen(header, sensitive_header - header->buf);
+		strbuf_addstr(header, " <redacted>");
+		ret = 1;
+	} else if (trace_curl_redact &&
 	    (skip_iprefix(header->buf + offset, "Authorization:", &sensitive_header) ||
 	     skip_iprefix(header->buf + offset, "Proxy-Authorization:", &sensitive_header))) {
 		/* The first token is the type, which is OK to log */
@@ -953,8 +1296,7 @@ static void redact_sensitive_info_header(struct strbuf *header)
 {
 	const char *sensitive_header;
 
-	if (trace_curl_redact &&
-	    match_curl_h2_trace(header->buf, &sensitive_header)) {
+	if (match_curl_h2_trace(header->buf, &sensitive_header)) {
 		if (redact_sensitive_header(header, sensitive_header - header->buf)) {
 			/* redaction ate our closing bracket */
 			strbuf_addch(header, ']');
@@ -975,7 +1317,8 @@ static void curl_dump_header(const char *text, unsigned char *ptr, size_t size, 
 	headers = strbuf_split_max(&out, '\n', 0);
 
 	for (header = headers; *header; header++) {
-		if (hide_sensitive_header)
+		if (hide_sensitive_header ||
+		    !strncasecmp((*header)->buf, "DPoP:", 5))
 			redact_sensitive_header(*header, 0);
 		strbuf_insertstr((*header), 0, text);
 		strbuf_insertstr((*header), strlen(text), ": ");
@@ -1429,6 +1772,7 @@ void http_init(struct remote *remote, const char *url, int proactive_auth)
 	config.cb = NULL;
 
 	http_is_verbose = 0;
+	http_dpop = 0;
 	normalized_url = url_normalize(url, &config.url);
 
 	repo_config(the_repository, urlmatch_config_entry, &config);
@@ -1552,11 +1896,11 @@ void http_cleanup(void)
 		struct active_request_slot *next = slot->next;
 		if (slot->curl)
 			xmulti_remove_handle(slot);
+		credential_dpop_observe(&slot->auth, 0);
 		clear_slot_request(slot);
 		if (slot->curl) {
 			curl_easy_cleanup(slot->curl);
 		}
-		credential_clear(&slot->auth);
 		free(slot);
 		slot = next;
 	}
@@ -1604,6 +1948,10 @@ void http_cleanup(void)
 	proxy_ssl_cert_password_required = 0;
 
 	FREE_AND_NULL(cached_accept_language);
+	credential_clear(&http_auth);
+	http_auth_needs_fill = 0;
+	http_auth_fill_capabilities = 0;
+	http_dpop = 0;
 }
 
 struct active_request_slot *get_active_slot(void)
@@ -1671,6 +2019,8 @@ struct active_request_slot *get_active_slot(void)
 	curl_easy_setopt(slot->curl, CURLOPT_ERRORBUFFER, curl_errorstr);
 	curl_easy_setopt(slot->curl, CURLOPT_CUSTOMREQUEST, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_READFUNCTION, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_SEEKFUNCTION, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_SEEKDATA, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
 	curl_easy_setopt(slot->curl, CURLOPT_HEADERDATA, &slot->auth);
@@ -1701,16 +2051,23 @@ struct active_request_slot *get_active_slot(void)
 
 int start_active_slot(struct active_request_slot *slot)
 {
-	CURLMcode curlm_result = curl_multi_add_handle(curlm, slot->curl);
+	CURLMcode curlm_result;
 	int num_transfers;
 
+	if (prepare_slot_auth(slot)) {
+		credential_dpop_observe(&slot->auth, 0);
+		clear_slot_request(slot);
+		closedown_active_slot(slot);
+		return 0;
+	}
+	curlm_result = curl_multi_add_handle(curlm, slot->curl);
 	if (curlm_result != CURLM_OK &&
 	    curlm_result != CURLM_CALL_MULTI_PERFORM) {
 		warning("curl_multi_add_handle failed: %s",
 			curl_multi_strerror(curlm_result));
 		active_requests--;
 		slot->in_use = 0;
-		credential_clear(&slot->auth);
+		credential_dpop_observe(&slot->auth, 0);
 		clear_slot_request(slot);
 		return 0;
 	}
@@ -1862,6 +2219,7 @@ static void release_active_slot(struct active_request_slot *slot)
 	closedown_active_slot(slot);
 	if (slot->curl)
 		xmulti_remove_handle(slot);
+	credential_dpop_observe(&slot->auth, 0);
 	clear_slot_request(slot);
 	if (slot->curl) {
 		if (curl_session_count > min_curl_sessions) {
@@ -1870,7 +2228,6 @@ static void release_active_slot(struct active_request_slot *slot)
 			curl_session_count--;
 		}
 	}
-	credential_clear(&slot->auth);
 	fill_active_slots();
 }
 
@@ -1971,6 +2328,14 @@ static int handle_curl_result(struct slot_results *results)
 		credential_approve(the_repository, &proxy_auth);
 		credential_approve(the_repository, &cert_auth);
 		return HTTP_OK;
+	} else if (results->dpop && results->http_code == 401) {
+		return results->dpop_nonce ? HTTP_DPOP_NONCE : HTTP_NOAUTH;
+	} else if (results->dpop &&
+		   results->http_code >= 300 && results->http_code < 400) {
+		strlcpy(curl_errorstr,
+			"refusing to follow a redirect for a DPoP-authenticated request",
+			sizeof(curl_errorstr));
+		return HTTP_ERROR;
 	} else if (results->curl_result == CURLE_SSL_CERTPROBLEM) {
 		/*
 		 * We can't tell from here whether it's a bad path, bad
@@ -2032,9 +2397,12 @@ static int handle_curl_result(struct slot_results *results)
 int run_one_slot(struct active_request_slot *slot,
 		 struct slot_results *results)
 {
+	memset(results, 0, sizeof(*results));
+	results->retry_after = -1;
 	slot->results = results;
 
 	if (!start_active_slot(slot)) {
+		results->curl_result = CURLE_FAILED_INIT;
 		xsnprintf(curl_errorstr, sizeof(curl_errorstr),
 			  "failed to start HTTP request");
 		return HTTP_START_FAILED;
@@ -2317,9 +2685,7 @@ static int http_request(const char *url,
 			headers = curl_slist_append(headers, item->string);
 	}
 
-	headers = http_append_auth_header(&http_auth, headers);
-
-	http_set_request(slot, result ? "GET" : "HEAD", url, headers);
+	http_set_request(slot, result ? "GET" : "HEAD", url, headers, 1);
 	curl_easy_setopt(slot->curl, CURLOPT_ENCODING, "");
 	curl_easy_setopt(slot->curl, CURLOPT_FAILONERROR, 0L);
 
@@ -2388,6 +2754,14 @@ static int update_url_from_redirect(struct strbuf *base,
 
 	if (!strcmp(asked, got->buf))
 		return 0;
+	if (http_dpop) {
+		char *target = transport_anonymize_url(asked);
+		int same = !strcmp(target, got->buf);
+
+		free(target);
+		if (same)
+			return 0;
+	}
 
 	if (!skip_prefix(asked, base->buf, &tail))
 		BUG("update_url_from_redirect: %s is not a superset of %s",
@@ -2449,16 +2823,24 @@ static int http_request_recoverable(const char *url,
 	int i = 3;
 	int ret;
 	int rate_limit_retries = http_max_retries;
+	int dpop_nonce_retried = 0;
 
 	if (!options)
 		options = &empty_opts;
 
-	if (always_auth_proactively())
-		credential_fill(the_repository, &http_auth, 1);
+	if (always_auth_proactively()) {
+		if (http_dpop) {
+			http_auth_needs_fill = 1;
+			http_auth_fill_capabilities = 1;
+		} else {
+			credential_fill(the_repository, &http_auth, 1);
+		}
+	}
 
 	ret = http_request(url, result, target, options);
 
-	if (ret != HTTP_OK && ret != HTTP_REAUTH && ret != HTTP_RATE_LIMITED)
+	if (ret != HTTP_OK && ret != HTTP_REAUTH &&
+	    ret != HTTP_RATE_LIMITED && ret != HTTP_DPOP_NONCE)
 		return ret;
 
 	/* If retries are disabled and we got a 429, fail immediately */
@@ -2474,6 +2856,7 @@ static int http_request_recoverable(const char *url,
 	}
 
 	while ((ret == HTTP_REAUTH && --i) ||
+	       (ret == HTTP_DPOP_NONCE && !dpop_nonce_retried++) ||
 	       (ret == HTTP_RATE_LIMITED && --rate_limit_retries)) {
 		long retry_delay = -1;
 		/*
@@ -2482,7 +2865,8 @@ static int http_request_recoverable(const char *url,
 		 */
 		switch (target) {
 		case HTTP_REQUEST_STRBUF:
-			strbuf_reset(result);
+			if (result)
+				strbuf_reset(result);
 			break;
 		case HTTP_REQUEST_FILE: {
 			FILE *f = result;
@@ -2521,6 +2905,11 @@ static int http_request_recoverable(const char *url,
 		trace2_data_string("http", the_repository,
 				   "http/429-error", "retries-exhausted");
 		return HTTP_RATE_LIMITED;
+	}
+	if (ret == HTTP_DPOP_NONCE) {
+		strlcpy(curl_errorstr, "DPoP nonce retry exhausted",
+			sizeof(curl_errorstr));
+		return HTTP_NOAUTH;
 	}
 	return ret;
 }
@@ -2821,7 +3210,7 @@ struct http_pack_request *new_direct_http_pack_request(
 	preq->headers = object_request_headers();
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq->packfile);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
-	http_set_request(preq->slot, "GET", preq->url, preq->headers);
+	http_set_request(preq->slot, "GET", preq->url, preq->headers, 0);
 
 	if (prev_posn > 0) {
 		if (http_is_verbose)
@@ -2990,7 +3379,7 @@ struct http_object_request *new_http_object_request(const char *base_url,
 	curl_easy_setopt(freq->slot->curl, CURLOPT_FAILONERROR, 0L);
 	curl_easy_setopt(freq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_sha1_file);
 	curl_easy_setopt(freq->slot->curl, CURLOPT_ERRORBUFFER, freq->errorstr);
-	http_set_request(freq->slot, "GET", freq->url, freq->headers);
+	http_set_request(freq->slot, "GET", freq->url, freq->headers, 0);
 
 	/*
 	 * If we have successfully processed data from a previous fetch

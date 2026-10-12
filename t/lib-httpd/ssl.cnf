@@ -1,8 +1,11 @@
-RANDFILE                = $ENV::RANDFILE_PATH
+RANDFILE                = .rnd
 
 [ req ]
 default_bits            = 2048
 distinguished_name      = req_distinguished_name
 prompt                  = no
+x509_extensions         = v3_test
 [ req_distinguished_name ]
 commonName              = 127.0.0.1
+[ v3_test ]
+subjectAltName           = IP:127.0.0.1

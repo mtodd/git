@@ -22,6 +22,8 @@ struct slot_results {
 	long auth_avail;
 	long http_connectcode;
 	long retry_after;
+	unsigned dpop:1;
+	unsigned dpop_nonce:1;
 };
 
 struct active_request_slot {
@@ -38,6 +40,9 @@ struct active_request_slot {
 	struct curl_slist *request_headers;
 	char *request_method;
 	char *request_url;
+	unsigned dpop:1;
+	unsigned dpop_nonce:1;
+	unsigned append_auth_header:1;
 };
 
 struct buffer {
@@ -53,9 +58,14 @@ int seek_buffer(void *clientp, curl_off_t offset, int origin);
 
 /* Slot lifecycle functions */
 struct active_request_slot *get_active_slot(void);
-/* Bind one transfer's context and owned headers before activating its slot. */
+/*
+ * Bind one transfer to a method, URL and header list. append_auth_header
+ * preserves the caller's existing non-DPoP authtype behavior; a selected
+ * DPoP helper always supplies request-local authentication.
+ */
 void http_set_request(struct active_request_slot *slot, const char *method,
-		      const char *url, const struct curl_slist *headers);
+		      const char *url, const struct curl_slist *headers,
+		      int append_auth_header);
 int start_active_slot(struct active_request_slot *slot);
 void run_active_slot(struct active_request_slot *slot);
 void finish_all_active_slots(void);
@@ -89,6 +99,7 @@ extern struct credential http_auth;
  * via credential_fill() so the next request can include them.
  */
 void http_reauth_prepare(int all_capabilities);
+int http_is_dpop(void);
 
 extern char curl_errorstr[CURL_ERROR_SIZE];
 
@@ -190,6 +201,7 @@ struct http_get_options {
 #define HTTP_NOAUTH	5
 #define HTTP_NOMATCHPUBLICKEY	6
 #define HTTP_RATE_LIMITED	7
+#define HTTP_DPOP_NONCE	8
 
 /*
  * Requests a URL and stores the result in a strbuf.

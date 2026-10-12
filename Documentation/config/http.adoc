@@ -1,3 +1,40 @@
+http.dpop::
+	Allow request-bound DPoP authentication through credential helpers.
+	Defaults to `false`. Prefer a URL-scoped setting such as
+	`http.https://example.com/repo.git.dpop=true` rather than enabling it
+	for all remotes.
++
+This permits Git to send the actual HTTP method and complete request URL to
+configured helper candidates. `credential.useHttpPath` still controls the
+separate credential lookup path. The new context is not disclosed unless
+explicitly enabled, and DPoP is selected only after capability negotiation
+and a complete helper response. A legacy `authtype` string alone does not
+select this protocol.
++
+Helpers which decline DPoP can still supply ordinary credentials, including
+partial username/password results from a helper chain. Complete ordinary
+credentials retain their existing reuse and approval behavior; this setting
+does not cause additional helper lookups for each request unless DPoP was
+selected. In particular, a URL which supplies both a user name and a password
+is a complete ordinary credential. It is used and approved as it would be
+without this setting and is never offered to a helper for DPoP selection;
+supply only the user name to let a helper select DPoP.
++
+This setting permits negotiation; it does not require authentication for a
+public resource. An initial anonymous smart HTTP discovery request is allowed.
+`http.proactiveAuth` retains control over initial credential use. After DPoP
+selection, each authenticated request requires its own proof.
++
+The remote URL and each request target must be enabled by the URL-matching
+configuration. User information is removed from the HTTP/proof target and
+retained only as a separate username hint. See linkgit:git-credential[1] for
+the helper protocol and limitations.
++
+Operations which do not bind their method and URL to the request-bound
+transport, including WebDAV pushes and direct `git http-push`, are refused
+when the remote is opted in. Disabling this setting retains ordinary DAV
+behavior.
+
 http.proxy::
 	Override the HTTP proxy, normally configured using the 'http_proxy',
 	'https_proxy', and 'all_proxy' environment variables (see `curl(1)`). In

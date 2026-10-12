@@ -26,6 +26,8 @@
 #include "transport.h"
 #include "url.h"
 #include "write-or-die.h"
+#include "path.h"
+#include "tempfile.h"
 
 static struct remote *remote;
 /* always ends with a trailing slash */
@@ -769,6 +771,49 @@ static int rpc_seek(void *clientp, curl_off_t offset, int origin)
 	return CURL_SEEKFUNC_FAIL;
 }
 
+static struct tempfile *rpc_spool_request(struct rpc_state *rpc)
+{
+	struct tempfile *body;
+	FILE *out;
+	char buf[8192];
+	size_t n;
+
+	if (have_git_dir()) {
+		char *path = repo_git_path(the_repository, "dpop-rpc-XXXXXX");
+
+		body = mks_tempfile(path);
+		free(path);
+	} else {
+		body = mks_tempfile_t("git-dpop-rpc-XXXXXX");
+	}
+	if (!body) {
+		error_errno(_("unable to spool DPoP request"));
+		return NULL;
+	}
+	out = fdopen_tempfile(body, "w+");
+	if (!out)
+		goto fail;
+	while ((n = rpc_out(buf, 1, sizeof(buf), rpc)))
+		if (fwrite(buf, 1, n, out) != n)
+			goto fail;
+	if (fflush(out) || fseeko(out, 0, SEEK_SET))
+		goto fail;
+	return body;
+
+fail:
+	error_errno(_("unable to spool DPoP request"));
+	delete_tempfile(&body);
+	return NULL;
+}
+
+static size_t rpc_file_out(char *ptr, size_t size, size_t nmemb, void *data)
+{
+	FILE *in = data;
+	size_t n = fread(ptr, 1, st_mult(size, nmemb), in);
+
+	return ferror(in) ? CURL_READFUNC_ABORT : n;
+}
+
 struct check_pktline_state {
 	char len_buf[4];
 	int len_filled;
@@ -856,7 +901,7 @@ static int run_slot(struct active_request_slot *slot,
 
 	err = run_one_slot(slot, results);
 
-	if (err != HTTP_OK && err != HTTP_REAUTH) {
+	if (err != HTTP_OK && err != HTTP_REAUTH && err != HTTP_DPOP_NONCE) {
 		struct strbuf msg = STRBUF_INIT;
 		if (results->http_code && results->http_code != 200)
 			strbuf_addf(&msg, "HTTP %ld", results->http_code);
@@ -881,24 +926,32 @@ static int probe_rpc(struct rpc_state *rpc, struct slot_results *results)
 	struct active_request_slot *slot;
 	struct curl_slist *headers = http_copy_default_headers();
 	struct strbuf buf = STRBUF_INIT;
-	int err;
+	int err, nonce_retried = 0;
 
+retry:
 	slot = get_active_slot();
 
-	headers = curl_slist_append(headers, rpc->hdr_content_type);
-	headers = curl_slist_append(headers, rpc->hdr_accept);
-	headers = http_append_auth_header(&http_auth, headers);
+	if (!nonce_retried) {
+		headers = curl_slist_append(headers, rpc->hdr_content_type);
+		headers = curl_slist_append(headers, rpc->hdr_accept);
+	}
 
 	curl_easy_setopt(slot->curl, CURLOPT_NOBODY, 0L);
 	curl_easy_setopt(slot->curl, CURLOPT_POST, 1L);
 	curl_easy_setopt(slot->curl, CURLOPT_ENCODING, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, "0000");
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, 4L);
-	http_set_request(slot, "POST", rpc->service_url, headers);
+	http_set_request(slot, "POST", rpc->service_url, headers, 1);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, fwrite_buffer);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEDATA, &buf);
 
 	err = run_slot(slot, results);
+	if (err == HTTP_DPOP_NONCE && !nonce_retried++) {
+		strbuf_reset(&buf);
+		goto retry;
+	}
+	if (err == HTTP_DPOP_NONCE)
+		error(_("DPoP nonce retry exhausted"));
 
 	curl_slist_free_all(headers);
 	strbuf_release(&buf);
@@ -918,6 +971,8 @@ static int post_rpc(struct rpc_state *rpc, int stateless_connect, int flush_rece
 	size_t gzip_size = 0;
 	int err, large_request = 0;
 	int needs_100_continue = 0;
+	int nonce_retried = 0;
+	struct tempfile *request_body = NULL;
 	struct rpc_in_data rpc_in_data;
 
 	/* Try to load the entire request, if we can fit it into the
@@ -950,8 +1005,19 @@ static int post_rpc(struct rpc_state *rpc, int stateless_connect, int flush_rece
 		if (err != HTTP_OK)
 			return -1;
 
-		if (results.auth_avail & CURLAUTH_GSSNEGOTIATE || http_auth.authtype)
+		if (!http_is_dpop() &&
+		    (results.auth_avail & CURLAUTH_GSSNEGOTIATE || http_auth.authtype))
 			needs_100_continue = 1;
+		/*
+		 * A nonce can change after the probe, including after a server
+		 * has read the complete body. Keep the streaming wire format,
+		 * but retain a replayable body before sending any signed RPC.
+		 */
+		if (http_is_dpop()) {
+			request_body = rpc_spool_request(rpc);
+			if (!request_body)
+				return -1;
+		}
 	}
 
 retry:
@@ -961,8 +1027,6 @@ retry:
 	headers = curl_slist_append(headers, needs_100_continue ?
 		"Expect: 100-continue" : "Expect:");
 
-	headers = http_append_auth_header(&http_auth, headers);
-
 	/* Add Accept-Language header */
 	if (rpc->hdr_accept_language)
 		headers = curl_slist_append(headers, rpc->hdr_accept_language);
@@ -971,6 +1035,11 @@ retry:
 	if (rpc->protocol_header)
 		headers = curl_slist_append(headers, rpc->protocol_header);
 
+	if (request_body && fseeko(get_tempfile_fp(request_body), 0, SEEK_SET)) {
+		error_errno(_("unable to rewind DPoP request"));
+		err = -1;
+		goto cleanup;
+	}
 	slot = get_active_slot();
 
 	curl_easy_setopt(slot->curl, CURLOPT_NOBODY, 0L);
@@ -984,11 +1053,20 @@ retry:
 #ifdef GIT_CURL_NEED_TRANSFER_ENCODING_HEADER
 		headers = curl_slist_append(headers, "Transfer-Encoding: chunked");
 #endif
-		rpc->initial_buffer = 1;
-		curl_easy_setopt(slot->curl, CURLOPT_READFUNCTION, rpc_out);
-		curl_easy_setopt(slot->curl, CURLOPT_INFILE, rpc);
-		curl_easy_setopt(slot->curl, CURLOPT_SEEKFUNCTION, rpc_seek);
-		curl_easy_setopt(slot->curl, CURLOPT_SEEKDATA, rpc);
+		if (request_body) {
+			FILE *in = get_tempfile_fp(request_body);
+
+			curl_easy_setopt(slot->curl, CURLOPT_READFUNCTION, rpc_file_out);
+			curl_easy_setopt(slot->curl, CURLOPT_INFILE, in);
+			curl_easy_setopt(slot->curl, CURLOPT_SEEKFUNCTION, NULL);
+			curl_easy_setopt(slot->curl, CURLOPT_SEEKDATA, NULL);
+		} else {
+			rpc->initial_buffer = 1;
+			curl_easy_setopt(slot->curl, CURLOPT_READFUNCTION, rpc_out);
+			curl_easy_setopt(slot->curl, CURLOPT_INFILE, rpc);
+			curl_easy_setopt(slot->curl, CURLOPT_SEEKFUNCTION, rpc_seek);
+			curl_easy_setopt(slot->curl, CURLOPT_SEEKDATA, rpc);
+		}
 		if (options.verbosity > 1) {
 			fprintf(stderr, "POST %s (chunked)\n", rpc->service_name);
 			fflush(stderr);
@@ -1000,6 +1078,7 @@ retry:
 		 * run will have set up the headers and gzip buffer already,
 		 * and we just need to send it.
 		 */
+		headers = curl_slist_append(headers, "Content-Encoding: gzip");
 		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, gzip_body);
 		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE_LARGE, cast_size_t_to_curl_off_t(gzip_size));
 
@@ -1053,7 +1132,7 @@ retry:
 		}
 	}
 
-	http_set_request(slot, "POST", rpc->service_url, headers);
+	http_set_request(slot, "POST", rpc->service_url, headers, 1);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, rpc_in);
 	rpc_in_data.rpc = rpc;
 	rpc_in_data.slot = slot;
@@ -1070,6 +1149,13 @@ retry:
 		curl_slist_free_all(headers);
 		goto retry;
 	}
+	if (err == HTTP_DPOP_NONCE && !nonce_retried++ &&
+	    (!large_request || request_body)) {
+		curl_slist_free_all(headers);
+		goto retry;
+	}
+	if (err == HTTP_DPOP_NONCE)
+		error(_("DPoP nonce retry exhausted or request body cannot be replayed"));
 	if (err != HTTP_OK)
 		err = -1;
 
@@ -1084,7 +1170,9 @@ retry:
 	if (stateless_connect)
 		packet_response_end(rpc->in);
 
+cleanup:
 	curl_slist_free_all(headers);
+	delete_tempfile(&request_body);
 	free(gzip_body);
 	return err;
 }

@@ -63,6 +63,43 @@ test_expect_success 'clone remote repository' '
 	git clone $HTTPD_URL/dumb/test_repo.git test_repo_clone
 '
 
+test_expect_success 'opted-in direct http-push refuses unbound DAV requests' '
+	test_when_finished "git -C \"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-ref -d refs/heads/dpop-direct &&
+		git -C \"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-server-info" &&
+	test_must_fail git -C "$ROOT_PATH/test_repo_clone" \
+		-c "http.$HTTPD_URL/dumb/test_repo.git.dpop=true" \
+		http-push "$HTTPD_URL/dumb/test_repo.git/" \
+		HEAD:refs/heads/dpop-direct >out 2>err &&
+	test_grep "DPoP does not support unbound HTTP operations" err &&
+	test_must_fail git -C "$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git" \
+		show-ref --verify refs/heads/dpop-direct
+'
+
+test_expect_success 'opted-in remote-curl DAV fallback refuses unbound requests' '
+	test_when_finished "git -C \"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-ref -d refs/heads/dpop-fallback &&
+		git -C \"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-server-info" &&
+	test_must_fail git -C "$ROOT_PATH/test_repo_clone" \
+		-c "http.$HTTPD_URL/dumb/test_repo.git.dpop=true" \
+		push "$HTTPD_URL/dumb/test_repo.git/" \
+		HEAD:refs/heads/dpop-fallback >out 2>err &&
+	test_grep "DPoP does not support unbound HTTP operations" err &&
+	test_must_fail git -C "$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git" \
+		show-ref --verify refs/heads/dpop-fallback
+'
+
+test_expect_success 'explicitly disabled DPoP preserves direct DAV pushes' '
+	test_when_finished "git -C \"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-ref -d refs/heads/ordinary-direct &&
+		git -C \"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-server-info" &&
+	git -C "$ROOT_PATH/test_repo_clone" \
+		-c "http.$HTTPD_URL/dumb/test_repo.git.dpop=false" \
+		http-push "$HTTPD_URL/dumb/test_repo.git/" \
+		HEAD:refs/heads/ordinary-direct &&
+	git -C "$ROOT_PATH/test_repo_clone" rev-parse HEAD >expect &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git" rev-parse \
+		refs/heads/ordinary-direct >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success 'push to remote repository with packed refs' '
 	cd "$ROOT_PATH"/test_repo_clone &&
 	: >path2 &&
